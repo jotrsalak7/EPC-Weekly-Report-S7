@@ -1367,6 +1367,58 @@ const[projects,setProjects]=useState(SEED_DATA.projects||[]);
     const[cloudStatus,setCloudStatus]=useState(SheetsService.isConfigured()?'syncing':'notconfigured');
     const[lastSync,setLastSync]=useState('');
     const[hydrated,setHydrated]=useState(false);
+    const[syncInProgress,setSyncInProgress]=useState(false);
+
+    // Helper: Pull semua data dari Google Sheets
+    const pullFromSheets=async()=>{
+        if(!SheetsService.isConfigured()){
+            showNotif('Google Sheets belum di-konfigurasi di CONFIG','error');
+            return;
+        }
+        if(syncInProgress)return;
+        setSyncInProgress(true);
+        setCloudStatus('syncing');
+        try{
+            const d=await SheetsService.loadAll();
+            if(d?.projects&&d.projects.length)setProjects(d.projects);
+            if(d?.reports&&d.reports.length)setReports(d.reports);
+            const ts=new Date().toLocaleString('id-ID');
+            setLastSync(ts);
+            setCloudStatus('synced');
+            showNotif(`✓ Loaded: ${d?.projects?.length||0} projects, ${d?.reports?.length||0} reports`);
+        }catch(e){
+            console.error('[Pull error]',e);
+            setCloudStatus('error');
+            showNotif('Pull gagal: '+e.message,'error');
+        }finally{
+            setSyncInProgress(false);
+        }
+    };
+
+    // Helper: Push semua data ke Google Sheets
+    const pushToSheets=async()=>{
+        if(!SheetsService.isConfigured()){
+            showNotif('Google Sheets belum di-konfigurasi di CONFIG','error');
+            return;
+        }
+        if(syncInProgress)return;
+        if(!confirm(`Push ${projects.length} projects + ${reports.length} reports ke Google Sheets?\n\nData existing di Sheets akan di-overwrite.`))return;
+        setSyncInProgress(true);
+        setCloudStatus('syncing');
+        try{
+            await SheetsService.bulkSync({projects,reports});
+            const ts=new Date().toLocaleString('id-ID');
+            setLastSync(ts);
+            setCloudStatus('synced');
+            showNotif(`✓ Pushed: ${projects.length} projects + ${reports.length} reports`);
+        }catch(e){
+            console.error('[Push error]',e);
+            setCloudStatus('error');
+            showNotif('Push gagal: '+e.message,'error');
+        }finally{
+            setSyncInProgress(false);
+        }
+    };
 
     // On mount: try Sheets first, fall back to localStorage, else use seed data
     useEffect(()=>{
@@ -1714,14 +1766,26 @@ const[projects,setProjects]=useState(SEED_DATA.projects||[]);
     const updateReportUpload=(reportId,field)=>{
         CloudService.openWidget(
             (fileInfo)=>{
-                setReports(reports.map(r=>r.id===reportId?{...r,uploads:{...r.uploads,[field]:fileInfo}}:r));
-                showNotif('Foto terupload ke Cloudinary');
-                if(CONFIG.AUTO_SYNC&&SheetsService.isConfigured()){
-                    const updated={...reports.find(r=>r.id===reportId),uploads:{...reports.find(r=>r.id===reportId)?.uploads,[field]:fileInfo}};
-                    SheetsService.saveReport(updated).then(()=>setLastSync(new Date().toLocaleString('id-ID'))).catch(e=>console.warn('Auto-sync failed:',e));
-                }
+                // Functional setState untuk menghindari stale closure
+                setReports(prev=>{
+                    const next=prev.map(r=>r.id===reportId?{...r,uploads:{...r.uploads,[field]:fileInfo}}:r);
+                    if(CONFIG.AUTO_SYNC&&SheetsService.isConfigured()){
+                        const updated=next.find(r=>r.id===reportId);
+                        if(updated){
+                            SheetsService.saveReport(updated)
+                                .then(()=>setLastSync(new Date().toLocaleString('id-ID')))
+                                .catch(e=>console.warn('Auto-sync failed:',e));
+                        }
+                    }
+                    return next;
+                });
+                showNotif('Foto terupload ke Cloudinary: '+fileInfo.name);
+                console.log('[Cloudinary Upload]', {reportId, field, url: fileInfo.url});
             },
-            (err)=>showNotif('Upload gagal: '+err.message,'error')
+            (err)=>{
+                console.error('[Cloudinary Error]', err);
+                showNotif('Upload gagal: '+err.message,'error');
+            }
         );
     };
     const handleFileUpload=(field)=>{
@@ -3125,6 +3189,75 @@ const[projects,setProjects]=useState(SEED_DATA.projects||[]);
             </div>
         )}
 
+        {/* Upload Debug Inspector — verifikasi URL Cloudinary tersimpan */}
+        <div className="card" style={{padding:20,marginBottom:20}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+                <h3 style={{fontWeight:700,color:'#0f172a'}}>Upload Inspector</h3>
+                <span style={{fontSize:11,color:'#64748b'}}>
+                    {reports.reduce((n,r)=>n+Object.values(r.uploads||{}).filter(u=>u&&u.url&&u.url.startsWith('https://')).length,0)} Cloudinary URLs •
+                    {' '}{reports.reduce((n,r)=>n+Object.values(r.uploads||{}).filter(u=>u&&(!u.url||u.url==='')&&!u.data).length,0)} empty
+                </span>
+            </div>
+            <p style={{fontSize:12,color:'#64748b',marginBottom:12}}>
+                Panel ini menampilkan semua URL foto yang ter-attach ke setiap report. Gunakan untuk memverifikasi upload Cloudinary sudah masuk ke state dengan benar.
+            </p>
+            <div style={{maxHeight:300,overflowY:'auto',border:'1px solid #e2e8f0',borderRadius:8}}>
+                <table style={{width:'100%',fontSize:11,borderCollapse:'collapse'}}>
+                    <thead style={{position:'sticky',top:0,background:'#f8fafc',zIndex:1}}>
+                        <tr>
+                            <th style={{padding:8,textAlign:'left',borderBottom:'1px solid #e2e8f0',fontWeight:600}}>Week</th>
+                            <th style={{padding:8,textAlign:'left',borderBottom:'1px solid #e2e8f0',fontWeight:600}}>Field</th>
+                            <th style={{padding:8,textAlign:'left',borderBottom:'1px solid #e2e8f0',fontWeight:600}}>Status</th>
+                            <th style={{padding:8,textAlign:'left',borderBottom:'1px solid #e2e8f0',fontWeight:600}}>URL / Preview</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {reports.flatMap(r=>{
+                            const fields=['sCurveGeneral','sCurveEngineering','sCurveProcurement','sCurveConstruction','sCurveCommissioning','cashFlow','qrPhotos','qrVideos','qrReport'];
+                            return fields.map(f=>{
+                                const u=r.uploads?.[f];
+                                if(!u)return null;
+                                const hasUrl=u.url&&u.url.startsWith('https://');
+                                const isLegacy=u.data||u.isLegacy;
+                                const needsMigration=u.needsMigration;
+                                let statusLabel,statusColor;
+                                if(hasUrl){statusLabel='Cloudinary ✓';statusColor='#16a34a';}
+                                else if(isLegacy){statusLabel='Base64 (legacy)';statusColor='#f59e0b';}
+                                else if(needsMigration){statusLabel='Needs upload';statusColor='#dc2626';}
+                                else{statusLabel='Empty';statusColor='#94a3b8';}
+                                return(
+                                    <tr key={`${r.id}-${f}`} style={{borderBottom:'1px solid #f1f5f9'}}>
+                                        <td style={{padding:8,fontWeight:600}}>W{r.weekNo}</td>
+                                        <td style={{padding:8,fontFamily:'monospace',fontSize:10}}>{f}</td>
+                                        <td style={{padding:8}}><span style={{color:statusColor,fontWeight:600,fontSize:10}}>{statusLabel}</span></td>
+                                        <td style={{padding:8,maxWidth:400}}>
+                                            {hasUrl?(
+                                                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                                                    <img src={CloudService.getThumbnail(u.url,40)} style={{width:40,height:40,objectFit:'cover',borderRadius:4,cursor:'pointer'}} onClick={()=>setImageViewer({src:u.url,title:`W${r.weekNo} ${f}`})}/>
+                                                    <div style={{flex:1,overflow:'hidden'}}>
+                                                        <p style={{fontSize:10,fontFamily:'monospace',color:'#0f766e',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{u.url}</p>
+                                                        <p style={{fontSize:9,color:'#64748b',marginTop:2}}>{u.name||'—'} • {u.bytes?(u.bytes/1024).toFixed(0)+' KB':''}</p>
+                                                    </div>
+                                                    <button onClick={()=>navigator.clipboard.writeText(u.url).then(()=>showNotif('URL disalin'))} style={{background:'#f1f5f9',border:'1px solid #cbd5e1',borderRadius:4,padding:'3px 8px',fontSize:10,cursor:'pointer'}}>Copy</button>
+                                                </div>
+                                            ):(
+                                                <span style={{fontSize:10,color:'#94a3b8'}}>
+                                                    {isLegacy?`base64 (${((u.data||u.url||'').length/1024).toFixed(0)} KB inline)`:'— no file —'}
+                                                </span>
+                                            )}
+                                        </td>
+                                    </tr>
+                                );
+                            }).filter(Boolean);
+                        })}
+                        {!reports.some(r=>r.uploads&&Object.keys(r.uploads).length>0)&&(
+                            <tr><td colSpan="4" style={{padding:20,textAlign:'center',color:'#94a3b8',fontSize:12}}>No uploads attached yet. Go to S-Curve & QR tab to upload photos.</td></tr>
+                        )}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
     </div>);
 
     // Report Modal with Enhanced Cash Flow Tab
@@ -3666,7 +3799,37 @@ const[projects,setProjects]=useState(SEED_DATA.projects||[]);
         </div><div style={{padding:12,borderTop:'1px solid #e2e8f0',display:'flex',justifyContent:'flex-end',gap:8}}><button className="btn btn-secondary" onClick={()=>setShowModal(null)}>Cancel</button><button className="btn btn-primary" onClick={saveProject}><Icons.Save/> Save</button></div></div></div>);
     };
 
-    return(<div style={{display:'flex',minHeight:'100vh'}}><div className={`sidebar ${sidebarCollapsed?'collapsed':''}`}><div style={{display:'flex',alignItems:'center',gap:10,marginBottom:24,paddingLeft:4}}><div style={{width:36,height:36,background:'rgba(255,255,255,0.2)',borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center'}}><Icons.Chart/></div><span className="sidebar-text" style={{fontWeight:700,fontSize:13,color:'white',letterSpacing:'-0.01em'}}>EPC Dashboard v5</span></div><nav>{[{id:'dashboard',icon:<Icons.Dashboard/>,label:'Dashboard'},{id:'projects',icon:<Icons.Project/>,label:'Projects'},{id:'reports',icon:<Icons.Report/>,label:'Weekly Reports'},{id:'scurve',icon:<Icons.Chart/>,label:'S-Curve & QR'},{id:'analysis',icon:<Icons.Analysis/>,label:'Risk Analysis'},{id:'data',icon:<Icons.Database/>,label:'Data Mgmt'}].map(item=>(<div key={item.id} className={`nav-item ${activeMenu===item.id?'active':''}`} onClick={()=>setActiveMenu(item.id)}>{item.icon}<span className="sidebar-text">{item.label}</span></div>))}</nav><div style={{position:'absolute',bottom:20,left:12,right:12}}><div className="nav-item" onClick={()=>setSidebarCollapsed(!sidebarCollapsed)}><Icons.Menu/><span className="sidebar-text">Collapse</span></div></div></div><div className={`main-content ${sidebarCollapsed?'expanded':''}`}>{activeMenu==='dashboard'&&renderDashboard()}{activeMenu==='projects'&&renderProjects()}{activeMenu==='reports'&&renderReports()}{activeMenu==='scurve'&&renderSCurve()}{activeMenu==='analysis'&&renderAnalysis()}{activeMenu==='data'&&renderDataMgmt()}</div>{showModal==='project'&&renderProjectModal()}{showModal==='report'&&renderReportModal()}{showModal==='viewReport'&&renderViewReportModal()}{imageViewer&&<div className="modal-overlay" style={{background:'rgba(0,0,0,0.9)'}} onClick={()=>setImageViewer(null)}><div style={{position:'relative',maxWidth:'90vw',maxHeight:'90vh'}}><div style={{position:'absolute',top:-36,left:0,right:0,display:'flex',justifyContent:'space-between',alignItems:'center'}}><h3 style={{color:'white',fontWeight:600,fontSize:13}}>{imageViewer.title}</h3><button onClick={()=>setImageViewer(null)} style={{background:'rgba(255,255,255,0.2)',border:'none',borderRadius:6,padding:'4px 10px',color:'white',cursor:'pointer',fontSize:11}}>✕ Close</button></div><img src={imageViewer.src} alt={imageViewer.title} style={{maxWidth:'90vw',maxHeight:'85vh',objectFit:'contain',borderRadius:8}} onClick={e=>e.stopPropagation()}/></div></div>}{notification&&<div className="toast" style={{background:notification.type==='error'?'#dc2626':'#0f766e'}}><Icons.Check/>{notification.msg}</div>}</div>);
+    return(<div style={{display:'flex',minHeight:'100vh'}}><div className={`sidebar ${sidebarCollapsed?'collapsed':''}`}><div style={{display:'flex',alignItems:'center',gap:10,marginBottom:24,paddingLeft:4}}><div style={{width:36,height:36,background:'rgba(255,255,255,0.2)',borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center'}}><Icons.Chart/></div><span className="sidebar-text" style={{fontWeight:700,fontSize:13,color:'white',letterSpacing:'-0.01em'}}>EPC Dashboard v5</span></div><nav>{[{id:'dashboard',icon:<Icons.Dashboard/>,label:'Dashboard'},{id:'projects',icon:<Icons.Project/>,label:'Projects'},{id:'reports',icon:<Icons.Report/>,label:'Weekly Reports'},{id:'scurve',icon:<Icons.Chart/>,label:'S-Curve & QR'},{id:'analysis',icon:<Icons.Analysis/>,label:'Risk Analysis'},{id:'data',icon:<Icons.Database/>,label:'Data Mgmt'}].map(item=>(<div key={item.id} className={`nav-item ${activeMenu===item.id?'active':''}`} onClick={()=>setActiveMenu(item.id)}>{item.icon}<span className="sidebar-text">{item.label}</span></div>))}</nav><div style={{position:'absolute',bottom:20,left:12,right:12}}><div className="nav-item" onClick={()=>setSidebarCollapsed(!sidebarCollapsed)}><Icons.Menu/><span className="sidebar-text">Collapse</span></div></div></div><div className={`main-content ${sidebarCollapsed?'expanded':''}`}>
+<div style={{position:'sticky',top:0,zIndex:50,background:'white',borderBottom:'1px solid #e2e8f0',padding:'10px 20px',marginLeft:-20,marginRight:-20,marginTop:-20,marginBottom:16,display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',boxShadow:'0 1px 2px rgba(15,23,42,0.04)'}}>
+<div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+<CloudBadge status={cloudStatus} lastSync={lastSync}/>
+<span style={{fontSize:11,color:'#64748b'}}>
+{SheetsService.isConfigured()?`${projects.length}P / ${reports.length}R`:'Offline mode'}
+{lastSync&&` • Last: ${lastSync}`}
+</span>
+</div>
+<div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+<button
+className="btn btn-primary btn-sm"
+disabled={!SheetsService.isConfigured()||syncInProgress}
+onClick={pullFromSheets}
+style={{display:'flex',alignItems:'center',gap:6,opacity:(!SheetsService.isConfigured()||syncInProgress)?0.5:1}}
+title="Load data dari Google Sheets (overwrite local)">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+{syncInProgress?'Loading...':'Load from Sheets'}
+</button>
+<button
+className="btn btn-secondary btn-sm"
+disabled={!SheetsService.isConfigured()||syncInProgress}
+onClick={pushToSheets}
+style={{display:'flex',alignItems:'center',gap:6,opacity:(!SheetsService.isConfigured()||syncInProgress)?0.5:1}}
+title="Push semua data ke Google Sheets (overwrite sheets)">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+{syncInProgress?'Pushing...':'Push to Sheets'}
+</button>
+</div>
+</div>
+{activeMenu==='dashboard'&&renderDashboard()}{activeMenu==='projects'&&renderProjects()}{activeMenu==='reports'&&renderReports()}{activeMenu==='scurve'&&renderSCurve()}{activeMenu==='analysis'&&renderAnalysis()}{activeMenu==='data'&&renderDataMgmt()}</div>{showModal==='project'&&renderProjectModal()}{showModal==='report'&&renderReportModal()}{showModal==='viewReport'&&renderViewReportModal()}{imageViewer&&<div className="modal-overlay" style={{background:'rgba(0,0,0,0.9)'}} onClick={()=>setImageViewer(null)}><div style={{position:'relative',maxWidth:'90vw',maxHeight:'90vh'}}><div style={{position:'absolute',top:-36,left:0,right:0,display:'flex',justifyContent:'space-between',alignItems:'center'}}><h3 style={{color:'white',fontWeight:600,fontSize:13}}>{imageViewer.title}</h3><button onClick={()=>setImageViewer(null)} style={{background:'rgba(255,255,255,0.2)',border:'none',borderRadius:6,padding:'4px 10px',color:'white',cursor:'pointer',fontSize:11}}>✕ Close</button></div><img src={imageViewer.src} alt={imageViewer.title} style={{maxWidth:'90vw',maxHeight:'85vh',objectFit:'contain',borderRadius:8}} onClick={e=>e.stopPropagation()}/></div></div>}{notification&&<div className="toast" style={{background:notification.type==='error'?'#dc2626':'#0f766e'}}><Icons.Check/>{notification.msg}</div>}</div>);
 };
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
